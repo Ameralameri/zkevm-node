@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/0xPolygonHermez/zkevm-node/event"
@@ -18,7 +17,8 @@ import (
 
 // Sequencer represents a sequencer
 type Sequencer struct {
-	cfg Config
+	cfg      Config
+	batchCfg state.BatchConfig
 
 	pool         txPool
 	state        stateInterface
@@ -27,33 +27,6 @@ type Sequencer struct {
 	etherman     etherman
 
 	address common.Address
-}
-
-// batchConstraints represents the constraints for a batch
-type batchConstraints struct {
-	MaxTxsPerBatch       uint64
-	MaxBatchBytesSize    uint64
-	MaxCumulativeGasUsed uint64
-	MaxKeccakHashes      uint32
-	MaxPoseidonHashes    uint32
-	MaxPoseidonPaddings  uint32
-	MaxMemAligns         uint32
-	MaxArithmetics       uint32
-	MaxBinaries          uint32
-	MaxSteps             uint32
-}
-
-// TODO: Add tests to config_test.go
-type batchResourceWeights struct {
-	WeightBatchBytesSize    int
-	WeightCumulativeGasUsed int
-	WeightKeccakHashes      int
-	WeightPoseidonHashes    int
-	WeightPoseidonPaddings  int
-	WeightMemAligns         int
-	WeightArithmetics       int
-	WeightBinaries          int
-	WeightSteps             int
 }
 
 // L2ReorgEvent is the event that is triggered when a reorg happens in the L2
@@ -68,14 +41,8 @@ type ClosingSignalCh struct {
 	L2ReorgCh     chan L2ReorgEvent
 }
 
-// pendingTxPerAddressTracker is a struct that tracks the number of pending transactions per address
-type pendingTxPerAddressTracker struct {
-	wg    *sync.WaitGroup
-	count uint
-}
-
 // New init sequencer
-func New(cfg Config, txPool txPool, state stateInterface, etherman etherman, manager ethTxManager, eventLog *event.EventLog) (*Sequencer, error) {
+func New(cfg Config, batchCfg state.BatchConfig, txPool txPool, state stateInterface, etherman etherman, manager ethTxManager, eventLog *event.EventLog) (*Sequencer, error) {
 	addr, err := etherman.TrustedSequencer()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get trusted sequencer address, err: %v", err)
@@ -83,6 +50,7 @@ func New(cfg Config, txPool txPool, state stateInterface, etherman etherman, man
 
 	return &Sequencer{
 		cfg:          cfg,
+		batchCfg:     batchCfg,
 		pool:         txPool,
 		state:        state,
 		etherman:     etherman,
@@ -106,49 +74,24 @@ func (s *Sequencer) Start(ctx context.Context) {
 		L2ReorgCh:     make(chan L2ReorgEvent),
 	}
 
-	batchConstraints := batchConstraints{
-		MaxTxsPerBatch:       s.cfg.MaxTxsPerBatch,
-		MaxBatchBytesSize:    s.cfg.MaxBatchBytesSize,
-		MaxCumulativeGasUsed: s.cfg.MaxCumulativeGasUsed,
-		MaxKeccakHashes:      s.cfg.MaxKeccakHashes,
-		MaxPoseidonHashes:    s.cfg.MaxPoseidonHashes,
-		MaxPoseidonPaddings:  s.cfg.MaxPoseidonPaddings,
-		MaxMemAligns:         s.cfg.MaxMemAligns,
-		MaxArithmetics:       s.cfg.MaxArithmetics,
-		MaxBinaries:          s.cfg.MaxBinaries,
-		MaxSteps:             s.cfg.MaxSteps,
-	}
-	batchResourceWeights := batchResourceWeights{
-		WeightBatchBytesSize:    s.cfg.WeightBatchBytesSize,
-		WeightCumulativeGasUsed: s.cfg.WeightCumulativeGasUsed,
-		WeightKeccakHashes:      s.cfg.WeightKeccakHashes,
-		WeightPoseidonHashes:    s.cfg.WeightPoseidonHashes,
-		WeightPoseidonPaddings:  s.cfg.WeightPoseidonPaddings,
-		WeightMemAligns:         s.cfg.WeightMemAligns,
-		WeightArithmetics:       s.cfg.WeightArithmetics,
-		WeightBinaries:          s.cfg.WeightBinaries,
-		WeightSteps:             s.cfg.WeightSteps,
-	}
-
 	err := s.pool.MarkWIPTxsAsPending(ctx)
 	if err != nil {
 		log.Fatalf("failed to mark WIP txs as pending, err: %v", err)
 	}
-	pendingTxsToStoreMux := new(sync.RWMutex)
-	pendingTxTrackerPerAddress := make(map[common.Address]*pendingTxPerAddressTracker)
 
-	worker := NewWorker(s.cfg.Worker, s.state, batchConstraints, batchResourceWeights, pendingTxsToStoreMux, pendingTxTrackerPerAddress)
-	dbManager := newDBManager(ctx, s.cfg.DBManager, s.pool, s.state, worker, closingSignalCh, batchConstraints)
+	worker := NewWorker(s.state, s.batchCfg.Constraints)
+	dbManager := newDBManager(ctx, s.cfg.DBManager, s.pool, s.state, worker, closingSignalCh, s.batchCfg.Constraints)
 	go dbManager.Start()
 
-	finalizer := newFinalizer(s.cfg.Finalizer, s.cfg.EffectiveGasPrice, worker, dbManager, s.state, s.address, s.isSynced, closingSignalCh, batchConstraints, s.eventLog, pendingTxsToStoreMux, pendingTxTrackerPerAddress)
+	finalizer := newFinalizer(s.cfg.Finalizer, s.cfg.EffectiveGasPrice, worker, dbManager, s.state, s.address, s.isSynced, closingSignalCh, s.batchCfg.Constraints, s.eventLog)
+
 	currBatch, processingReq := s.bootstrap(ctx, dbManager, finalizer)
 	go finalizer.Start(ctx, currBatch, processingReq)
 
 	closingSignalsManager := newClosingSignalsManager(ctx, finalizer.dbManager, closingSignalCh, finalizer.cfg, s.etherman)
 	go closingSignalsManager.Start()
 
-	go s.trackOldTxs(ctx)
+	go s.purgeOldPoolTxs(ctx)
 	tickerProcessTxs := time.NewTicker(s.cfg.WaitPeriodPoolIsEmpty.Duration)
 	defer tickerProcessTxs.Stop()
 
@@ -227,7 +170,7 @@ func (s *Sequencer) bootstrap(ctx context.Context, dbManager *dbManager, finaliz
 	return currBatch, processRequest
 }
 
-func (s *Sequencer) trackOldTxs(ctx context.Context) {
+func (s *Sequencer) purgeOldPoolTxs(ctx context.Context) {
 	ticker := time.NewTicker(s.cfg.FrequencyToCheckTxsForDelete.Duration)
 	for {
 		waitTick(ctx, ticker)
@@ -283,7 +226,7 @@ func (s *Sequencer) isSynced(ctx context.Context) bool {
 	return true
 }
 
-func getMaxRemainingResources(constraints batchConstraints) state.BatchResources {
+func getMaxRemainingResources(constraints state.BatchConstraintsCfg) state.BatchResources {
 	return state.BatchResources{
 		ZKCounters: state.ZKCounters{
 			CumulativeGasUsed:    constraints.MaxCumulativeGasUsed,
